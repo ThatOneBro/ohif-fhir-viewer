@@ -1,4 +1,5 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { useSystem } from '@ohif/core';
 import { PanelSection } from '@ohif/ui-next';
 import SubscribeForm from './fhircast/SubscribeForm';
@@ -8,12 +9,21 @@ import { DEFAULT_HUB_URL, DEFAULT_WS_URL, DEFAULT_TOPIC, DEFAULT_SELECTED_EVENTS
 import type { Subscription } from './fhircast/types';
 import { useFhircastSubscription } from './fhircast/useFhircastSubscription';
 import './fhircast/fhircast.css';
-import { getFhirConfig, getImagingStudyStore } from '../FhirDataSource';
+import {
+  getFhirConfig,
+  getImagingStudyStore,
+  registerImagingStudyContext,
+} from '../FhirDataSource';
 
 function FhirCastPanel() {
   const config = getFhirConfig();
   const { servicesManager } = useSystem();
   const { uiNotificationService } = servicesManager?.services || {};
+  const navigate = useNavigate();
+  const location = useLocation();
+  // Last study opened from context, so a repeated or echoed event doesn't
+  // re-navigate to the study already on screen.
+  const openedStudyUidRef = useRef<string>('');
 
   // Ordered hub-base candidates to probe when the SMART token didn't supply hub.url.
   // /api/hub first (Node on FHIR and the FHIRcast reference sandbox — also the fallback default
@@ -172,6 +182,49 @@ function FhirCastPanel() {
     }
   }, []);
 
+  // Open the study a FHIRcast event puts in context. The event names the study;
+  // the data source resolves its images. Route rather than load in place: the
+  // viewer keys off the StudyInstanceUIDs param, so navigating re-runs the
+  // mode's own initialize → retrieve → hanging-protocol sequence, the same path
+  // a click in the study list takes.
+  const openStudyFromContext = async (resource: Record<string, unknown>) => {
+    let registered: { StudyInstanceUID: string; patientId: string } | null = null;
+    try {
+      registered = await registerImagingStudyContext(resource);
+    } catch (err) {
+      console.error('[FhirCast] Could not register the ImagingStudy in context:', err);
+    }
+
+    const StudyInstanceUID = registered?.StudyInstanceUID;
+    if (!StudyInstanceUID) {
+      uiNotificationService?.show({
+        title: 'FHIRcast',
+        message:
+          'The event named an ImagingStudy with no DICOM study UID, so there is nothing to open. ' +
+          'The resource needs an identifier of system urn:dicom:uid.',
+        type: 'warning',
+        duration: 8000,
+      });
+      return;
+    }
+
+    if (openedStudyUidRef.current === StudyInstanceUID) return;
+    openedStudyUidRef.current = StudyInstanceUID;
+
+    // Keep every other param (iss, launch, patient, ...) and the current route:
+    // this panel only renders inside a viewer route, so its pathname already
+    // names the mode and the data source.
+    const query = new URLSearchParams(location.search);
+    query.set('StudyInstanceUIDs', StudyInstanceUID);
+    if (registered?.patientId) {
+      // The data source re-reads this on every route change and lists the
+      // patient's studies from it, so it has to move with the context.
+      query.set('patient', registered.patientId);
+    }
+    console.log('[FhirCast] Opening study from context:', StudyInstanceUID);
+    navigate(`${location.pathname}?${query.toString()}`);
+  };
+
   // Watch receivedEvents for ImagingStudy context updates
   useEffect(() => {
     if (receivedEvents.length === 0) return;
@@ -182,14 +235,24 @@ function FhirCastPanel() {
     const contexts = evt['context'] || evt?.context;
     if (!Array.isArray(contexts)) return;
 
+    // `*-close` withdraws context. Everything else that carries a study —
+    // ImagingStudy-open/update/select, and DiagnosticReport-open, which per the
+    // FHIRcast IG carries the study it reports on — puts one in focus.
+    const eventName = String(evt['hub.event'] || '');
+    const opensStudy = eventName !== '' && !eventName.endsWith('-close');
+
     for (const ctx of contexts) {
-      if (ctx.key === 'study' && ctx.resource?.resourceType === 'ImagingStudy') {
+      if (ctx.resource?.resourceType === 'ImagingStudy') {
         const study = ctx.resource;
         if (study.status) setImagingStudyStatus(study.status);
         if (study.id) setImagingStudyId(study.id);
+        if (opensStudy) {
+          openStudyFromContext(study);
+        }
         break;
       }
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [receivedEvents]);
 
   const hasSubscriptions = Object.keys(subscriptions).length > 0;

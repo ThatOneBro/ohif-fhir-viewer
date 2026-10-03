@@ -30,6 +30,14 @@ const metadataProvider = OHIF.classes.MetadataProvider;
 
 const PLACEHOLDER_STUDY_UID = '__fhir_pending__';
 
+// OHIF's own DICOMweb data source, borrowed as an image source. A FHIR
+// ImagingStudy names a study and its series, but usually stops there: no
+// `series[].instance[]` entries and never pixel data. When it does, this
+// extension can still serve as the context layer — which patient, which study,
+// which FHIRcast session — and delegate instance metadata and image ids to a
+// DICOMweb store, which is where the pixels live anyway.
+const DICOMWEB_NAMESPACE = '@ohif/extension-default.dataSourcesModule.dicomweb';
+
 let _config = {
   // Absolute FHIR URLs — the browser calls the FHIR server directly (CORS),
   // so the server must allow the OHIF origin. These are dev fallbacks; a
@@ -49,6 +57,17 @@ let _config = {
   // when the granted scope includes `fhircast/`. Empty until a launch supplies them.
   hubUrl: '',
   hubTopic: '',
+  // DICOMweb image source, used for any study whose ImagingStudy carries no
+  // instance-level data. Opt-in: with none of these set, an instance-less
+  // ImagingStudy behaves exactly as before (series list only, then the
+  // DocumentReference fallback). `dicomWebRoot` sets all three services at
+  // once; `dicomWeb` takes a full OHIF DicomWebConfig, so a deployment can hand
+  // over the same tuning it already gives OHIF's own `dicomweb` source.
+  dicomWebRoot: '',
+  qidoRoot: '',
+  wadoRoot: '',
+  wadoUriRoot: '',
+  dicomWeb: null,
 };
 
 let _store = {
@@ -57,9 +76,17 @@ let _store = {
   studyToFhirId: new Map(),
   imagingStudyMap: new Map(),
   loadedStudies: new Set(),
+  // Studies whose metadata came from DICOMweb rather than the ImagingStudy.
+  // Their instances carry wadors image ids, so image-id construction has to go
+  // back to the delegate rather than through the FHIR attachment path.
+  dicomWebStudies: new Set(),
+  dicomWebAttempted: new Set(),
 };
 
 let _servicesManager = null;
+let _extensionManager = null;
+// undefined = not built yet, null = unavailable (not configured, or build failed)
+let _dicomWebDelegate;
 
 function arrayBufferToBase64(buffer) {
   const bytes = new Uint8Array(buffer);
@@ -89,6 +116,14 @@ function wrapSequences(obj) {
 
 export function updateFhirConfig(newConfig) {
   Object.assign(_config, newConfig);
+
+  // The delegate is built once from the roots below; rebuild it if they move
+  // (a SMART launch can rewrite the server after the data source is created).
+  const rootKeys = ['dicomWebRoot', 'qidoRoot', 'wadoRoot', 'wadoUriRoot', 'dicomWeb'];
+  if (newConfig && rootKeys.some(key => key in newConfig)) {
+    _dicomWebDelegate = undefined;
+    _store.dicomWebAttempted.clear();
+  }
 }
 
 export function getFhirConfig() {
@@ -233,8 +268,274 @@ function resolveSmartClientId(query) {
   return _config.smartClientId || '';
 }
 
-function createFhirApi(fhirConfig, servicesManager) {
+// ── DICOMweb image source ───────────────────────────────────────────────────
+
+// Assemble the delegate's DicomWebConfig. `dicomWeb` is passed through verbatim
+// so every OHIF knob (staticWado, singlepart, bulkDataURI, accept headers) is
+// available; the explicit root keys win over it, and `dicomWebRoot` fills in
+// whichever of the three services is left unset. Returns null when no root is
+// configured — the delegation is opt-in and silent when absent.
+function _resolveDicomWebConfig() {
+  const overrides = _config.dicomWeb || {};
+  const root = _config.dicomWebRoot || '';
+  const qidoRoot = _config.qidoRoot || overrides.qidoRoot || root;
+  const wadoRoot = _config.wadoRoot || overrides.wadoRoot || root;
+
+  if (!qidoRoot || !wadoRoot) {
+    return null;
+  }
+
+  return {
+    imageRendering: 'wadors',
+    thumbnailRendering: 'wadors',
+    enableStudyLazyLoad: true,
+    qidoSupportsIncludeField: false,
+    supportsFuzzyMatching: false,
+    supportsWildcard: true,
+    ...overrides,
+    friendlyName: 'DICOMweb (via FHIR)',
+    name: 'fhir-dicomweb',
+    qidoRoot,
+    wadoRoot,
+    wadoUriRoot: _config.wadoUriRoot || overrides.wadoUriRoot || root,
+  };
+}
+
+// OHIF's DICOMweb source reads its bearer token from userAuthenticationService,
+// while the SMART token lives in _config — so without this bridge every
+// delegated QIDO/WADO-RS request goes out unauthenticated. Read _config lazily
+// so a token that arrives later (or is refreshed) is picked up, and fall through
+// to whatever implementation was installed before (OHIF's OIDC user manager, or
+// a `?token=` param) whenever there is no SMART token.
+function _bridgeAuthToken() {
+  const { userAuthenticationService } = _servicesManager?.services || {};
+  if (!userAuthenticationService) {
+    return;
+  }
+
+  // Capture the underlying implementation, not the public method: the public
+  // method dispatches to the implementation we are about to replace, so calling
+  // it from the replacement would recurse.
+  const previous = userAuthenticationService.serviceImplementation?._getAuthorizationHeader;
+  if (previous?.__fhirAuthBridge) {
+    return; // already ours
+  }
+
+  // Re-checked on every delegate access rather than latched, because anything
+  // else in the app may install its own implementation later (OHIF's OIDC
+  // provider does, on mount) and drop this one.
+  const bridged = () => {
+    if (_config.authToken) {
+      return { Authorization: `Bearer ${_config.authToken}` };
+    }
+    return (typeof previous === 'function' ? previous() : undefined) || {};
+  };
+  bridged.__fhirAuthBridge = true;
+
+  userAuthenticationService.setServiceImplementation({ getAuthorizationHeader: bridged });
+}
+
+// Build (once) the DICOMweb data source this one delegates to.
+function _getDicomWebDelegate() {
+  if (_dicomWebDelegate !== undefined) {
+    if (_dicomWebDelegate) {
+      _bridgeAuthToken();
+    }
+    return _dicomWebDelegate;
+  }
+  _dicomWebDelegate = null;
+
+  const dicomWebConfig = _resolveDicomWebConfig();
+  if (!dicomWebConfig) {
+    return null;
+  }
+
+  if (!_extensionManager) {
+    console.warn(
+      '[FHIR] DICOMweb roots are configured but no extensionManager was passed to ' +
+        'createFhirApi — cannot build the DICOMweb image source.'
+    );
+    return null;
+  }
+
+  const module = _extensionManager.getModuleEntry(DICOMWEB_NAMESPACE);
+  if (!module || typeof module.createDataSource !== 'function') {
+    console.warn('[FHIR] Could not resolve', DICOMWEB_NAMESPACE, '— is @ohif/extension-default loaded?');
+    return null;
+  }
+
+  try {
+    _bridgeAuthToken();
+    const delegate = module.createDataSource(dicomWebConfig, _servicesManager, _extensionManager);
+    // The DICOMweb source builds its client in initialize(); params/query only
+    // feed its optional onConfiguration hook.
+    delegate.initialize({ params: {}, query: new URLSearchParams(window.location.search) });
+    _dicomWebDelegate = delegate;
+    console.log('[FHIR] DICOMweb image source ready:', {
+      qidoRoot: dicomWebConfig.qidoRoot,
+      wadoRoot: dicomWebConfig.wadoRoot,
+    });
+  } catch (error) {
+    console.error('[FHIR] Failed to build the DICOMweb image source:', error);
+    _dicomWebDelegate = null;
+  }
+
+  return _dicomWebDelegate;
+}
+
+// True when this study's metadata came from DICOMweb, so image ids have to be
+// built by the delegate (wadors frame urls) rather than read off a FHIR
+// attachment. Keyed by study because a session can mix both kinds.
+function _isDicomWebStudy(StudyInstanceUID) {
+  return !!StudyInstanceUID && _store.dicomWebStudies.has(StudyInstanceUID);
+}
+
+/**
+ * Retrieve series/instance metadata for a study from DICOMweb.
+ *
+ * Returns the delegate's result on success (an array of series promise wrappers
+ * when the caller asked for them, which the route starts in hanging-protocol
+ * order), or false when there is no DICOMweb source or it has nothing for this
+ * study — in which case the caller carries on down the FHIR paths.
+ */
+async function _retrieveMetadataFromDicomWeb({
+  StudyInstanceUID,
+  filters,
+  sortCriteria,
+  sortFunction,
+  madeInClient,
+  returnPromises,
+}) {
+  const delegate = _getDicomWebDelegate();
+  if (!delegate) {
+    return false;
+  }
+  if (_store.dicomWebAttempted.has(StudyInstanceUID) && !_isDicomWebStudy(StudyInstanceUID)) {
+    return false;
+  }
+  _store.dicomWebAttempted.add(StudyInstanceUID);
+
+  console.log('[FHIR] Retrieving instance metadata from DICOMweb for', StudyInstanceUID);
+
+  // Mark the study delegated before the retrieve, not after: the non-lazy path
+  // stores instances (and fires INSTANCES_ADDED) inside the await, and anything
+  // that asks for an image id in that window has to be routed to the delegate.
+  // Unmarked again below if the retrieve turns out to have nothing for it.
+  _store.dicomWebStudies.add(StudyInstanceUID);
+
+  let result;
+  try {
+    result = await delegate.retrieve.series.metadata({
+      StudyInstanceUID,
+      filters,
+      sortCriteria,
+      sortFunction,
+      madeInClient,
+      returnPromises,
+    });
+  } catch (error) {
+    console.error('[FHIR] DICOMweb metadata retrieve failed for', StudyInstanceUID, error);
+    _store.dicomWebStudies.delete(StudyInstanceUID);
+    const { qidoRoot } = _resolveDicomWebConfig() || {};
+    _showFhirError(_servicesManager, error, qidoRoot);
+    return false;
+  }
+
+  // The lazy-load path returns before instances land, so count series instead:
+  // an empty result means the DICOMweb store doesn't have this study.
+  const study = DicomMetadataStore.getStudy(StudyInstanceUID, madeInClient);
+  const seriesCount = study?.series?.length || 0;
+  if (!seriesCount) {
+    console.warn('[FHIR] DICOMweb has no series for', StudyInstanceUID);
+    _store.dicomWebStudies.delete(StudyInstanceUID);
+    return false;
+  }
+
+  console.log(`[FHIR] DICOMweb returned ${seriesCount} series for`, StudyInstanceUID);
+  _store.loadedStudies.add(StudyInstanceUID);
+
+  return result === undefined ? true : result;
+}
+
+/**
+ * Register an ImagingStudy that arrived as FHIRcast context and return its
+ * StudyInstanceUID, or null if it has none.
+ *
+ * A FHIRcast `ImagingStudy-open` (or `DiagnosticReport-open`) event carries the
+ * study as context, and per the spec that context is usually a stub — the hub
+ * says *which* study is in focus, it doesn't ship its contents. So fetch the
+ * full resource when the stub has no series, then seed the same store the
+ * study-list path seeds, so `retrieve.series.metadata` can resolve the study
+ * when the viewer routes to it.
+ *
+ * Returns `{ StudyInstanceUID, patientId }`, or null when the resource names no
+ * DICOM study.
+ */
+async function registerImagingStudyContext(resource) {
+  if (!resource || resource.resourceType !== 'ImagingStudy') {
+    return null;
+  }
+
+  let study = resource;
+  if (!study.series && study.id) {
+    try {
+      study = await fetchImagingStudyById(_config.fhirBaseUrl, study.id, {
+        authToken: _config.authToken,
+      });
+    } catch (error) {
+      console.warn('[FHIR] Could not fetch the ImagingStudy named by FHIRcast context:', error);
+      study = resource;
+    }
+  }
+
+  const summary = imagingStudyToStudySummary(study, '');
+  const StudyInstanceUID = summary.StudyInstanceUID;
+  if (!StudyInstanceUID) {
+    console.warn('[FHIR] FHIRcast ImagingStudy context carries no study UID:', resource);
+    return null;
+  }
+
+  if (study.id) {
+    _store.studyToFhirId.set(StudyInstanceUID, study.id);
+  }
+  _store.imagingStudyMap.set(StudyInstanceUID, study);
+
+  // Front of the list: getStudyInstanceUIDs() hands these to the route in order,
+  // and the first one is what the hanging protocol opens.
+  const others = _store.studyInstanceUIDs.filter(
+    uid => uid && uid !== StudyInstanceUID && uid !== PLACEHOLDER_STUDY_UID
+  );
+  _store.studyInstanceUIDs = [StudyInstanceUID, ...others];
+
+  // Keep the study resolvable even before any metadata arrives — the hanging
+  // protocol service crashes on a StudyInstanceUID the store can't resolve.
+  DicomMetadataStore.addStudy({
+    StudyInstanceUID,
+    PatientID: summary.PatientID || '',
+    PatientName: summary.PatientName || '',
+    StudyDate: summary.StudyDate || '',
+    ModalitiesInStudy: summary.Modalities ? summary.Modalities.split('\\') : [],
+    StudyDescription: summary.StudyDescription || '',
+    AccessionNumber: summary.AccessionNumber || '',
+    NumInstances: summary.NumInstances || 0,
+  });
+
+  // Follow the subject as well. A FHIRcast event moves the whole context, so
+  // leaving _config.patientId on the previous patient would refill the study
+  // browser with that patient's studies alongside this one's.
+  const patientId = (study.subject?.reference || '').replace(/^Patient\//, '');
+  if (patientId && patientId !== _config.patientId) {
+    console.log('[FHIR] FHIRcast context switched patient:', _config.patientId, '->', patientId);
+    _config.patientId = patientId;
+  }
+
+  console.log('[FHIR] Registered ImagingStudy from FHIRcast context:', StudyInstanceUID);
+  return { StudyInstanceUID, patientId: patientId || _config.patientId || '' };
+}
+
+function createFhirApi(fhirConfig, servicesManager, extensionManager) {
   _servicesManager = servicesManager;
+  _extensionManager = extensionManager || _extensionManager;
   if (fhirConfig) {
     Object.assign(_config, fhirConfig);
   }
@@ -560,28 +861,76 @@ function createFhirApi(fhirConfig, servicesManager) {
 
     retrieve: {
       directURL: params => {
+        const StudyInstanceUID = params?.instance?.StudyInstanceUID;
+        if (_isDicomWebStudy(StudyInstanceUID)) {
+          return _getDicomWebDelegate()?.retrieve?.directURL?.(params);
+        }
         return params?.instance?.url || params?.tag;
+      },
+
+      // Study-browser thumbnails and bulkdata, for delegated studies only: a
+      // FHIR attachment has no thumbnail or bulkdata endpoint to ask, and the
+      // callers treat a missing result as "none" rather than an error. Gated on
+      // the study so studies loaded from FHIR don't fire requests at a DICOMweb
+      // server that has never heard of them.
+      getGetThumbnailSrc: (thumbnailContext, imageId) => {
+        if (!_isDicomWebStudy(thumbnailContext?.StudyInstanceUID)) {
+          return undefined;
+        }
+        return _getDicomWebDelegate()?.retrieve?.getGetThumbnailSrc?.(thumbnailContext, imageId);
+      },
+
+      bulkDataURI: params => {
+        if (!_isDicomWebStudy(params?.StudyInstanceUID)) {
+          return undefined;
+        }
+        return _getDicomWebDelegate()?.retrieve?.bulkDataURI?.(params);
       },
       series: {
         metadata: async ({
           filters = {},
           StudyInstanceUID,
           madeInClient = false,
+          sortCriteria,
+          sortFunction,
+          returnPromises = false,
         } = {}) => {
           if (!StudyInstanceUID || StudyInstanceUID === PLACEHOLDER_STUDY_UID) {
             return;
           }
 
           if (_store.loadedStudies.has(StudyInstanceUID)) {
-            // Verify the study still exists in DicomMetadataStore.
-            // Module-level _store persists across route changes, but the metadata
-            // store may be in a different state. Reprocess if the study is missing.
-            if (DicomMetadataStore.getStudy(StudyInstanceUID)) {
+            // Skipping is only safe while the work this function did is still
+            // standing, and that is two separate stores. DicomMetadataStore is a
+            // module singleton that survives route changes, but display sets do
+            // not: Mode.tsx calls displaySetService.init() on every mode entry
+            // and that assigns `activeDisplaySets = []`. Navigating back to an
+            // already-visited study therefore arrives with the metadata still
+            // cached and the display sets gone, and skipping on the metadata
+            // alone left the viewport black — nothing re-adds the instances, so
+            // no INSTANCES_ADDED fires and nothing rebuilds the display sets.
+            //
+            // Nothing else clears this either: deleteStudyMetadataPromise is the
+            // only hook that would, and OHIF calls it in exactly one place, after
+            // a STOW upload, never on navigation.
+            const displaySetService = _servicesManager?.services?.displaySetService;
+            const hasDisplaySets = !!displaySetService
+              ?.getActiveDisplaySets()
+              ?.some((ds) => ds.StudyInstanceUID === StudyInstanceUID);
+
+            if (DicomMetadataStore.getStudy(StudyInstanceUID) && hasDisplaySets) {
               console.log('[FHIR] metadata() — study already loaded, skipping:', StudyInstanceUID);
               return;
             }
-            console.warn('[FHIR] metadata() — study marked loaded but missing from DicomMetadataStore, reprocessing:', StudyInstanceUID);
+            console.warn('[FHIR] metadata() — study marked loaded but not renderable (metadata:',
+              !!DicomMetadataStore.getStudy(StudyInstanceUID), 'displaySets:', hasDisplaySets,
+              '), reprocessing:', StudyInstanceUID);
+            // Reprocessing re-derives all three, so drop the DICOMweb bookkeeping
+            // with it rather than leaving a stale verdict about where this study
+            // came from.
             _store.loadedStudies.delete(StudyInstanceUID);
+            _store.dicomWebAttempted.delete(StudyInstanceUID);
+            _store.dicomWebStudies.delete(StudyInstanceUID);
           }
 
           console.log('[FHIR] metadata() called for StudyInstanceUID:', StudyInstanceUID);
@@ -699,7 +1048,33 @@ function createFhirApi(fhirConfig, servicesManager) {
               }
             }
 
-            console.log('[FHIR] metadata() — seriesList.length:', seriesList.length, 'for', StudyInstanceUID);
+            let fhirInstanceCount = 0;
+            for (const [, instances] of instancesBySeriesUID) {
+              fhirInstanceCount += instances.length;
+            }
+
+            console.log('[FHIR] metadata() — seriesList.length:', seriesList.length, 'instances:', fhirInstanceCount, 'for', StudyInstanceUID);
+
+            // The ImagingStudy names the study and its series but carries no
+            // instances, so it cannot locate a single image: no
+            // `series[].instance[]` means no SOP Instance UIDs, and the study
+            // would load as a populated series list over an empty viewport.
+            // Ask DICOMweb for the instance level instead. Only reached when a
+            // DICOMweb root is configured; otherwise the series-only path below
+            // runs exactly as before.
+            if (fhirInstanceCount === 0) {
+              const delegated = await _retrieveMetadataFromDicomWeb({
+                StudyInstanceUID,
+                filters,
+                sortCriteria,
+                sortFunction,
+                madeInClient,
+                returnPromises,
+              });
+              if (delegated !== false) {
+                return delegated === true ? undefined : delegated;
+              }
+            }
 
             if (seriesList.length > 0) {
               let totalInstances = 0;
@@ -818,6 +1193,23 @@ function createFhirApi(fhirConfig, servicesManager) {
               }
 
               return;
+            }
+          }
+
+          // No usable ImagingStudy (missing resource, or no series at all). Try
+          // DICOMweb before DocumentReferences: a FHIRcast context can name a
+          // study by UID alone, which is all the DICOMweb query needs.
+          {
+            const delegated = await _retrieveMetadataFromDicomWeb({
+              StudyInstanceUID,
+              filters,
+              sortCriteria,
+              sortFunction,
+              madeInClient,
+              returnPromises,
+            });
+            if (delegated !== false) {
+              return delegated === true ? undefined : delegated;
             }
           }
 
@@ -997,6 +1389,10 @@ function createFhirApi(fhirConfig, servicesManager) {
     },
 
     getImageIdsForDisplaySet(displaySet) {
+      if (_isDicomWebStudy(displaySet?.StudyInstanceUID)) {
+        return _getDicomWebDelegate().getImageIdsForDisplaySet(displaySet);
+      }
+
       const images = displaySet.images;
       const imageIds = [];
 
@@ -1023,6 +1419,10 @@ function createFhirApi(fhirConfig, servicesManager) {
     },
 
     getImageIdsForInstance({ instance, frame }) {
+      if (_isDicomWebStudy(instance?.StudyInstanceUID)) {
+        return _getDicomWebDelegate().getImageIdsForInstance({ instance, frame });
+      }
+
       const baseImageId = instance.imageId || instance.url || '';
       if (frame !== undefined) {
         return `${baseImageId}&frame=${frame}`;
@@ -1033,14 +1433,51 @@ function createFhirApi(fhirConfig, servicesManager) {
     deleteStudyMetadataPromise: (StudyInstanceUID) => {
       console.log('[FHIR] deleteStudyMetadataPromise called for', StudyInstanceUID);
       _store.loadedStudies.delete(StudyInstanceUID);
+      _store.dicomWebAttempted.delete(StudyInstanceUID);
+      if (_store.dicomWebStudies.delete(StudyInstanceUID)) {
+        // Drop the delegate's cached study-metadata promise too, or a reopen
+        // resolves against metadata that is no longer in the store.
+        _getDicomWebDelegate()?.deleteStudyMetadataPromise?.(StudyInstanceUID);
+      }
     },
 
     getStudyInstanceUIDs: ({ params, query } = {}) => {
-      return _store.studyInstanceUIDs;
+      // A StudyInstanceUIDs param takes precedence: it is how the study list
+      // and the FHIRcast panel say which study to open. The rest of the store
+      // follows so the study browser still lists the patient's other studies.
+      const requested = [];
+      if (query && typeof query.getAll === 'function') {
+        for (const value of [...query.getAll('StudyInstanceUIDs'), ...query.getAll('studyInstanceUIDs')]) {
+          requested.push(...String(value).split(','));
+        }
+      }
+      const fromParams = params?.StudyInstanceUIDs || params?.studyInstanceUIDs;
+      if (fromParams) {
+        requested.push(...(Array.isArray(fromParams) ? fromParams : [fromParams]));
+      }
+
+      const uids = [];
+      for (const uid of [...requested, ..._store.studyInstanceUIDs]) {
+        const trimmed = typeof uid === 'string' ? uid.trim() : uid;
+        if (trimmed && !uids.includes(trimmed)) {
+          uids.push(trimmed);
+        }
+      }
+
+      // The placeholder only stands in for an empty list; drop it once a real
+      // study is present or the browser shows an "Awaiting FHIR context" row
+      // next to a study that is loading fine.
+      const real = uids.filter(uid => uid !== PLACEHOLDER_STUDY_UID);
+      return real.length > 0 ? real : [PLACEHOLDER_STUDY_UID];
     },
   };
 
   return IWebApiDataSource.create(implementation);
 }
 
-export { createFhirApi, PLACEHOLDER_STUDY_UID, registerSmartClient };
+export {
+  createFhirApi,
+  PLACEHOLDER_STUDY_UID,
+  registerSmartClient,
+  registerImagingStudyContext,
+};
