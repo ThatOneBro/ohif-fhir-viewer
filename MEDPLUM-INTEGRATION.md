@@ -218,6 +218,66 @@ The fastest interop check skips the OAuth dance by injecting a token manually.
 | Event ACK | No SyncError after 10s |
 | Unsubscribe | Clean disconnect |
 
+## 6. Load Images over DICOMweb
+
+Medplum's `ImagingStudy` resources carry series summaries but no
+`series[].instance[]` entries, so the FHIR resource names a study without being
+able to locate a single image of it: the study browser fills in and the viewport
+stays black. Medplum serves the pixels over DICOMweb at `<server>/dicomweb`, so
+point the `fhir` data source at it. Any study whose `ImagingStudy` has no
+instance data then gets its instance metadata and image ids from DICOMweb;
+studies that do inline instances are unaffected, and with no DICOMweb root set
+the behaviour is unchanged.
+
+```js
+{
+  namespace: '@ohif/fhir-viewer.dataSourcesModule.fhir',
+  sourceName: 'fhir',
+  configuration: {
+    fhirServerRoot: 'http://localhost:8103/',
+    fhirBaseUrl: 'http://localhost:8103/fhir/R4',
+    // Sets qidoRoot, wadoRoot and wadoUriRoot at once.
+    dicomWebRoot: 'http://localhost:8103/dicomweb',
+    // Optional: any OHIF DicomWebConfig field, passed through to the
+    // DICOMweb source. Medplum only implements WADO-RS frames, so render
+    // thumbnails from loaded images rather than the /thumbnail route.
+    dicomWeb: { imageRendering: 'wadors', thumbnailRendering: 'wadors', staticWado: true },
+    // DicomStudy/DicomSeries/DicomInstance are outside the patient
+    // compartment, so `patient/*.read` cannot reach them.
+    smartScope: 'launch openid fhirUser user/*.rs fhircast/Patient-open.read fhircast/ImagingStudy-open.read',
+  },
+}
+```
+
+The SMART token is forwarded to the DICOMweb requests. Without a SMART launch,
+FHIR reads, DICOMweb requests and hub POSTs fall back to the bearer token from
+OHIF's own `oidc` login, so a deployment that signs in to Medplum through OHIF
+does not need a separate launch.
+
+### Open a study from FHIRcast context
+
+With the panel subscribed to `ImagingStudy-open`, publish an event naming an
+`ImagingStudy`. A stub with just an `id` is enough; the viewer fetches the full
+resource, takes the study UID from its `urn:dicom:uid` identifier, and opens it:
+
+```bash
+curl -s -X POST "http://localhost:8103/fhircast/STU3/$TOPIC" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "timestamp": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'",
+    "id": "'$(uuidgen)'",
+    "event": {
+      "hub.topic": "'$TOPIC'",
+      "hub.event": "ImagingStudy-open",
+      "context": [{"key": "study", "resource": {"resourceType": "ImagingStudy", "id": "<imaging-study-id>"}}]
+    }
+  }'
+```
+
+The viewer follows context whichever side-panel tab is selected, and the
+subscription survives switching tabs or backgrounding the browser tab.
+
 ---
 
 For the full SMART EHR launch walkthrough, isolated curl hub tests, the Medplum
