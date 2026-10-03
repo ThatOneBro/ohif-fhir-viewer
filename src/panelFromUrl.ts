@@ -27,6 +27,16 @@ export function getPanelIdFromSearch(search: string): string | null {
 // isn't yanked back later.
 const RETRY_DELAYS_MS = [0, 300, 1000];
 
+// `?panel=` is a launch intent — "come up showing this panel" — not a standing
+// instruction to keep it open. But onModeEnter runs on every mode entry, and a
+// FHIRcast context switch navigates while preserving the query string, so the
+// param rode along and re-fired activatePanel(id, forceActive) on each hop:
+// close the panel, let an ImagingStudy-open arrive, and it forced itself back
+// open. Acting only when the value changes leaves the panel however the user
+// last left it, while still honouring a genuinely new request. A full page load
+// resets this, so a fresh launch URL always activates.
+let lastActivatedPanelParam: string | null = null;
+
 export function activatePanelFromUrl(servicesManager): void {
   let panelId = getPanelIdFromSearch(window.location.search);
 
@@ -47,6 +57,11 @@ export function activatePanelFromUrl(servicesManager): void {
   if (!panelId) {
     return;
   }
+
+  if (panelId === lastActivatedPanelParam) {
+    return;
+  }
+  lastActivatedPanelParam = panelId;
 
   const { panelService } = servicesManager.services;
   if (!panelService) {

@@ -7,6 +7,10 @@ import getCustomizationModule from './getCustomizationModule';
 import getSopClassHandlerModule from './getSopClassHandlerModule';
 import getDataSourcesModule from './getDataSourcesModule';
 import getPanelModule from './getPanelModule';
+import {
+  startFhircastContextListener,
+  suspendFhircastContextListener,
+} from './Panels/fhircast/fhircastContextListener';
 import getHangingProtocolModule from './getHangingProtocolModule';
 import getLayoutTemplateModule from './getLayoutTemplateModule';
 import initTools from './initTools';
@@ -35,10 +39,17 @@ export default {
     registerHangingProtocolAttributes({ servicesManager });
   },
 
-  onModeEnter({ servicesManager }) {
+  onModeEnter({ servicesManager, commandsManager }) {
     const { toolbarService } = servicesManager.services;
     toolbarService.register(getToolbarButtons());
     activatePanelFromUrl(servicesManager);
+    // Follow FHIRcast context for as long as the viewer is up, not just while
+    // the FHIRcast tab is the one selected.
+    startFhircastContextListener({ servicesManager, commandsManager });
+  },
+
+  onModeExit() {
+    suspendFhircastContextListener();
   },
 
   getCommandsModule(params) {

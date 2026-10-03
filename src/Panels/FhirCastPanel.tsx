@@ -1,5 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { useLocation, useNavigate } from 'react-router-dom';
+import React, { useState, useEffect } from 'react';
 import { useSystem } from '@ohif/core';
 import { PanelSection } from '@ohif/ui-next';
 import SubscribeForm from './fhircast/SubscribeForm';
@@ -8,22 +7,14 @@ import EventsList from './fhircast/EventsList';
 import { DEFAULT_HUB_URL, DEFAULT_WS_URL, DEFAULT_TOPIC, DEFAULT_SELECTED_EVENTS } from './fhircast/constants';
 import type { Subscription } from './fhircast/types';
 import { useFhircastSubscription } from './fhircast/useFhircastSubscription';
+import { getActiveParams, setImagingStudyContext } from './fhircast/fhircastSession';
 import './fhircast/fhircast.css';
-import {
-  getFhirConfig,
-  getImagingStudyStore,
-  registerImagingStudyContext,
-} from '../FhirDataSource';
+import { getFhirConfig, getImagingStudyStore } from '../FhirDataSource';
 
 function FhirCastPanel() {
   const config = getFhirConfig();
   const { servicesManager } = useSystem();
   const { uiNotificationService } = servicesManager?.services || {};
-  const navigate = useNavigate();
-  const location = useLocation();
-  // Last study opened from context, so a repeated or echoed event doesn't
-  // re-navigate to the study already on screen.
-  const openedStudyUidRef = useRef<string>('');
 
   // Ordered hub-base candidates to probe when the SMART token didn't supply hub.url.
   // /api/hub first (Node on FHIR and the FHIRcast reference sandbox — also the fallback default
@@ -51,30 +42,42 @@ function FhirCastPanel() {
     }
   };
 
+  // A live connection outlives this component, so on a remount the fields should
+  // describe what is actually connected rather than re-deriving a fresh guess.
+  const liveParams = getActiveParams();
+
   // Best synchronous guess (refined asynchronously by discovery below): prefer the SMART token's
   // hub.url, else the first probe candidate, else the static default.
   const tokenHubUrl = config.hubUrl || '';
-  const initialHubUrl = tokenHubUrl || buildCandidates(config.iss)[0] || DEFAULT_HUB_URL;
-  const initialWsUrl = deriveWsUrl(initialHubUrl);
+  const initialHubUrl =
+    liveParams?.hubUrl || tokenHubUrl || buildCandidates(config.iss)[0] || DEFAULT_HUB_URL;
+  const initialWsUrl = liveParams?.wsUrl || deriveWsUrl(initialHubUrl);
 
   // Prefer the FHIRcast session topic from the SMART launch, else the patient id.
-  const initialTopic = config.hubTopic || config.patientId || DEFAULT_TOPIC;
+  const initialTopic = liveParams?.topic || config.hubTopic || config.patientId || DEFAULT_TOPIC;
 
   // Form state
   const [hubUrl, setHubUrl] = useState(initialHubUrl);
   const [wsUrl, setWsUrl] = useState(initialWsUrl);
   const [topic, setTopic] = useState(initialTopic);
-  const [selectedEvents, setSelectedEvents] = useState<string[]>([...DEFAULT_SELECTED_EVENTS]);
+  const [selectedEvents, setSelectedEvents] = useState<string[]>(
+    liveParams?.events ? [...liveParams.events] : [...DEFAULT_SELECTED_EVENTS]
+  );
   const [saveToClient, setSaveToClient] = useState(true);
   const [saveToServer, setSaveToServer] = useState(false);
 
-  // Subscription hook (HTTP + WebSocket)
-  const { wsStatus, receivedEvents, subscribe, unsubscribe } = useFhircastSubscription();
-  const [subscriptions, setSubscriptions] = useState<Record<string, Subscription>>({});
+  // Subscription hook — a view onto the module-scoped session, so this survives
+  // the unmount that OHIF performs whenever another side-panel tab is selected.
+  const {
+    wsStatus,
+    receivedEvents,
+    subscriptions,
+    imagingStudyId,
+    imagingStudyStatus,
+    subscribe,
+    unsubscribe,
+  } = useFhircastSubscription();
 
-  // ImagingStudy context state
-  const [imagingStudyStatus, setImagingStudyStatus] = useState<string>('unknown');
-  const [imagingStudyId, setImagingStudyId] = useState<string>('');
 
   // Discover the FHIRcast hub on mount: SMART token hub.url → FHIR CapabilityStatement extension →
   // probe versioned/legacy candidates by their .well-known document. First match wins and updates
@@ -121,6 +124,13 @@ function FhirCastPanel() {
     };
 
     const discover = async () => {
+      // Never re-point the fields at a different hub while one is connected:
+      // this effect also runs on every remount, and the panel remounts on any
+      // side-panel tab switch. The connected hub is the answer already.
+      if (getActiveParams()) {
+        return;
+      }
+
       // 1. Token-provided hub.url — trust it even if a cross-origin probe is blocked.
       if (tokenHubUrl) {
         try {
@@ -170,90 +180,28 @@ function FhirCastPanel() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [config.iss, tokenHubUrl]);
 
-  // Read initial ImagingStudy status from the store on mount
+  // Seed the context banner once, if a study is already known and no event has
+  // set it yet. Guarded on the session value so a remount cannot overwrite what
+  // the listener has since recorded.
   useEffect(() => {
-    const studyMap = getImagingStudyStore();
-    if (studyMap && studyMap.size > 0) {
-      const firstStudy = studyMap.values().next().value;
-      if (firstStudy) {
-        setImagingStudyId(firstStudy.id || '');
-        setImagingStudyStatus(firstStudy.status || 'unknown');
-      }
-    }
-  }, []);
-
-  // Open the study a FHIRcast event puts in context. The event names the study;
-  // the data source resolves its images. Route rather than load in place: the
-  // viewer keys off the StudyInstanceUIDs param, so navigating re-runs the
-  // mode's own initialize → retrieve → hanging-protocol sequence, the same path
-  // a click in the study list takes.
-  const openStudyFromContext = async (resource: Record<string, unknown>) => {
-    let registered: { StudyInstanceUID: string; patientId: string } | null = null;
-    try {
-      registered = await registerImagingStudyContext(resource);
-    } catch (err) {
-      console.error('[FhirCast] Could not register the ImagingStudy in context:', err);
-    }
-
-    const StudyInstanceUID = registered?.StudyInstanceUID;
-    if (!StudyInstanceUID) {
-      uiNotificationService?.show({
-        title: 'FHIRcast',
-        message:
-          'The event named an ImagingStudy with no DICOM study UID, so there is nothing to open. ' +
-          'The resource needs an identifier of system urn:dicom:uid.',
-        type: 'warning',
-        duration: 8000,
-      });
+    if (imagingStudyId) {
       return;
     }
-
-    if (openedStudyUidRef.current === StudyInstanceUID) return;
-    openedStudyUidRef.current = StudyInstanceUID;
-
-    // Keep every other param (iss, launch, patient, ...) and the current route:
-    // this panel only renders inside a viewer route, so its pathname already
-    // names the mode and the data source.
-    const query = new URLSearchParams(location.search);
-    query.set('StudyInstanceUIDs', StudyInstanceUID);
-    if (registered?.patientId) {
-      // The data source re-reads this on every route change and lists the
-      // patient's studies from it, so it has to move with the context.
-      query.set('patient', registered.patientId);
-    }
-    console.log('[FhirCast] Opening study from context:', StudyInstanceUID);
-    navigate(`${location.pathname}?${query.toString()}`);
-  };
-
-  // Watch receivedEvents for ImagingStudy context updates
-  useEffect(() => {
-    if (receivedEvents.length === 0) return;
-    const latest = receivedEvents[0];
-    const evt = latest?.event;
-    if (!evt) return;
-
-    const contexts = evt['context'] || evt?.context;
-    if (!Array.isArray(contexts)) return;
-
-    // `*-close` withdraws context. Everything else that carries a study —
-    // ImagingStudy-open/update/select, and DiagnosticReport-open, which per the
-    // FHIRcast IG carries the study it reports on — puts one in focus.
-    const eventName = String(evt['hub.event'] || '');
-    const opensStudy = eventName !== '' && !eventName.endsWith('-close');
-
-    for (const ctx of contexts) {
-      if (ctx.resource?.resourceType === 'ImagingStudy') {
-        const study = ctx.resource;
-        if (study.status) setImagingStudyStatus(study.status);
-        if (study.id) setImagingStudyId(study.id);
-        if (opensStudy) {
-          openStudyFromContext(study);
-        }
-        break;
-      }
+    const studyMap = getImagingStudyStore();
+    const firstStudy = studyMap && studyMap.size > 0 ? studyMap.values().next().value : null;
+    if (firstStudy) {
+      setImagingStudyContext({
+        imagingStudyId: firstStudy.id || '',
+        imagingStudyStatus: firstStudy.status || 'unknown',
+      });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [receivedEvents]);
+  }, []);
+
+  // Reacting to context events lives in fhircastContextListener, registered from
+  // the extension's onModeEnter. It used to be an effect here, which meant the
+  // viewer only followed context while the FHIRcast tab happened to be the one
+  // on screen. The panel now just displays what the listener records.
 
   const hasSubscriptions = Object.keys(subscriptions).length > 0;
   const [subscribeError, setSubscribeError] = useState('');
@@ -286,10 +234,6 @@ function FhirCastPanel() {
     setSubscribeError('');
     try {
       await subscribe({ hubUrl, wsUrl, topic, events: selectedEvents, authToken: config.authToken || undefined });
-      setSubscriptions((prev) => ({
-        ...prev,
-        [topic]: { topic, events: [...selectedEvents], status: 'active' },
-      }));
     } catch (err) {
       showSubscribeError(err, 'Subscribe');
     }
@@ -298,24 +242,14 @@ function FhirCastPanel() {
   const handleUnsubscribe = async () => {
     setSubscribeError('');
     try {
-      await unsubscribe();
+      await unsubscribe(topic);
     } catch (err) {
       showSubscribeError(err, 'Unsubscribe');
     }
-    setSubscriptions((prev) => {
-      const next = { ...prev };
-      delete next[topic];
-      return next;
-    });
   };
 
   const handleUnsubscribeSub = (sub: Subscription) => {
-    unsubscribe();
-    setSubscriptions((prev) => {
-      const next = { ...prev };
-      delete next[sub.topic];
-      return next;
-    });
+    unsubscribe(sub.topic).catch((err) => showSubscribeError(err, 'Unsubscribe'));
   };
 
   return (

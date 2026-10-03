@@ -126,8 +126,42 @@ export function updateFhirConfig(newConfig) {
   }
 }
 
+/**
+ * The bearer token to send, falling back to OHIF's own session.
+ *
+ * This extension runs its own SMART flow and keeps the resulting token in
+ * `_config.authToken`, entirely separate from the OIDC login OHIF already
+ * performed. Nothing bridged the two, so on a deployment where the user is
+ * signed in to OHIF but never completed a SMART launch, every FHIR read and
+ * every FHIRcast hub POST went out with no Authorization header at all and the
+ * server answered 401 — while DICOM images loaded fine, because Cornerstone
+ * takes its headers from userAuthenticationService.
+ *
+ * Called at each request site rather than written back into `_config.authToken`.
+ * Caching it there would also feed the DICOMweb auth bridge below, which treats
+ * a set `_config.authToken` as "there is a SMART token" — so a snapshot taken at
+ * init would keep being sent after OHIF refreshed, and DICOM images would start
+ * failing. The extension's own SMART token still wins when there is one, so an
+ * explicit launch keeps its narrower scopes.
+ */
+export function getEffectiveAuthToken() {
+  if (_config.authToken) {
+    return _config.authToken;
+  }
+  try {
+    const headers = _servicesManager?.services?.userAuthenticationService?.getAuthorizationHeader?.();
+    const authorization = headers?.Authorization || headers?.authorization;
+    if (typeof authorization === 'string' && authorization.startsWith('Bearer ')) {
+      return authorization.slice('Bearer '.length);
+    }
+  } catch (e) {
+    // No OHIF authentication service configured — fall through unauthenticated.
+  }
+  return '';
+}
+
 export function getFhirConfig() {
-  return { ..._config };
+  return { ..._config, authToken: getEffectiveAuthToken() };
 }
 
 export function getImagingStudyStore() {
@@ -147,7 +181,7 @@ function base64Random() {
 async function _fetchStudyUIDs(patientId) {
   try {
     const studyBundle = await fetchImagingStudies(_config.fhirBaseUrl, patientId, {
-      authToken: _config.authToken,
+      authToken: getEffectiveAuthToken(),
     });
 
     const entries = studyBundle.entry || [];
@@ -325,8 +359,9 @@ function _bridgeAuthToken() {
   // else in the app may install its own implementation later (OHIF's OIDC
   // provider does, on mount) and drop this one.
   const bridged = () => {
-    if (_config.authToken) {
-      return { Authorization: `Bearer ${_config.authToken}` };
+    const token = getEffectiveAuthToken();
+    if (token) {
+      return { Authorization: `Bearer ${token}` };
     }
     return (typeof previous === 'function' ? previous() : undefined) || {};
   };
@@ -480,7 +515,7 @@ async function registerImagingStudyContext(resource) {
   if (!study.series && study.id) {
     try {
       study = await fetchImagingStudyById(_config.fhirBaseUrl, study.id, {
-        authToken: _config.authToken,
+        authToken: getEffectiveAuthToken(),
       });
     } catch (error) {
       console.warn('[FHIR] Could not fetch the ImagingStudy named by FHIRcast context:', error);
@@ -808,7 +843,7 @@ function createFhirApi(fhirConfig, servicesManager, extensionManager) {
           const patientId = _config.patientId;
           if (!patientId) return [];
 
-          const opts = { authToken: _config.authToken };
+          const opts = { authToken: getEffectiveAuthToken() };
 
           let patientName = '';
           try {
@@ -936,7 +971,7 @@ function createFhirApi(fhirConfig, servicesManager, extensionManager) {
           console.log('[FHIR] metadata() called for StudyInstanceUID:', StudyInstanceUID);
 
           try {
-          const opts = { authToken: _config.authToken };
+          const opts = { authToken: getEffectiveAuthToken() };
 
           // ── Try ImagingStudy series/instance data first ──
           let imagingStudy = _store.imagingStudyMap.get(StudyInstanceUID);
@@ -1119,7 +1154,7 @@ function createFhirApi(fhirConfig, servicesManager, extensionManager) {
                       const arrayBuffer = await fetchDicomFile(
                         _config.fhirServerRoot,
                         filePath,
-                        { authToken: _config.authToken }
+                        { authToken: getEffectiveAuthToken() }
                       );
 
                       const metadata = parseDicomArrayBuffer(
@@ -1249,7 +1284,7 @@ function createFhirApi(fhirConfig, servicesManager, extensionManager) {
                 const { imageId, metadata } = await loadDicomFromAttachment(
                   attachment,
                   _config.fhirServerRoot,
-                  _config.authToken
+                  getEffectiveAuthToken()
                 );
 
                 const SeriesInstanceUID = metadata.SeriesInstanceUID;
@@ -1381,7 +1416,7 @@ function createFhirApi(fhirConfig, servicesManager, extensionManager) {
 
         // 4. POST to FHIR server
         const result = await createDocumentReference(_config.fhirBaseUrl, docRef, {
-          authToken: _config.authToken,
+          authToken: getEffectiveAuthToken(),
         });
         console.log('[FHIR] DocumentReference created:', result.id);
         return result;
